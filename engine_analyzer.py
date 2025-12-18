@@ -3,12 +3,8 @@
 """
 engine_analyzer.py
 
-Полносвязная нейросеть (MLP) для анализа физико-математических моделей авиационных и ракетных двигателей.
-Поддерживает supervised (regression/classification) и unsupervised (autoencoder для обнаружения аномалий).
-Консольный интерфейс: выбор типа двигателя и добавление файлов модели (CSV/JSON/NPZ/MAT/TXT).
-
-Автор: denis-tsar
-Дата: 16.12.2025
+author: denis-tsar
+data: 18.12.2025
 """
 
 import os
@@ -21,10 +17,9 @@ from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import pandas as pd
-from scipy import signal
 from scipy.fft import rfft, rfftfreq
 from scipy.io import loadmat
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score, accuracy_score, roc_auc_score
