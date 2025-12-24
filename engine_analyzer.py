@@ -32,6 +32,136 @@ from torch.utils.data import Dataset, DataLoader
 import scipy.stats as stats
 from multiprocessing import Pool, cpu_count
 
+def read_cmapss_file(path: str, n_settings: int = 3) -> pd.DataFrame:
+    df = pd.read_csv(path, sep=r'\s+', header=None, engine='python')
+    n_cols = df.shape[1]
+    if n_cols < 5:
+        raise ValueError(f"Файл {path} имеет неожидимое число колонок: {n_cols}")
+    if n_cols - 2 < n_settings + 1:
+        n_settings = max(0, n_cols - 3)
+    n_sensors = n_cols - 2 - n_settings
+    cols = ['unit', 'cycle'] + [f'op_setting_{i+1}' for i in range(n_settings)] + [f'sensor_{i+1}' for i in range(n_sensors)]
+    df.columns = cols
+    df['unit'] = df['unit'].astype(int)
+    df['cycle'] = df['cycle'].astype(int)
+    return df
+
+def read_rul_file(path: str) -> np.ndarray:
+    arr = np.loadtxt(path, dtype=float)
+    if arr.ndim > 1:
+        arr = arr[:, 0]
+    return np.array(arr, dtype=float)
+
+def attach_rul_train(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    max_cycle = df.groupby('unit')['cycle'].transform('max')
+    df['RUL'] = (max_cycle - df['cycle']).astype(int)
+    return df
+
+def attach_rul_test(df: pd.DataFrame, rul_arr: np.ndarray) -> pd.DataFrame:
+    df = df.copy()
+    units = np.sort(df['unit'].unique())
+    if len(rul_arr) != len(units):
+        raise ValueError(f"RUL array length {len(rul_arr)} != units in test {len(units)}")
+    rul_map = {u: float(rul_arr[i]) for i, u in enumerate(units)}
+    max_cycle = df.groupby('unit')['cycle'].transform('max')
+    df['RUL'] = df.apply(lambda r: rul_map[int(r['unit'])] + (max_cycle.loc[r.name] - r['cycle']), axis=1)
+    df['RUL'] = df['RUL'].astype(float)
+    return df
+
+def build_cmapss_window_dataset(df: pd.DataFrame,
+                                window_size: int = 30,
+                                step: int = 1,
+                                sensors_only: bool = True,
+                                feature_extractor = None,
+                                min_cycle_for_window: int = None,
+                                mode: str = 'sliding'):
+
+    if feature_extractor is None:
+        feature_extractor = extract_time_series_features
+
+    sensor_cols = [c for c in df.columns if c.startswith('sensor_')]
+    if sensors_only:
+        feat_cols = sensor_cols
+    else:
+        setting_cols = [c for c in df.columns if c.startswith('op_setting_')]
+        feat_cols = setting_cols + sensor_cols
+
+    if min_cycle_for_window is None:
+        min_cycle_for_window = window_size
+
+    samples = []
+    labels = []
+    metas = []
+
+    groups = df.groupby('unit')
+    for unit, g in groups:
+        g_sorted = g.sort_values('cycle').reset_index(drop=True)
+        values = g_sorted[feat_cols].values.astype(float)
+        rul = g_sorted['RUL'].values.astype(float)
+        L = values.shape[0]
+        if mode == 'sliding':
+            start_idx = 0
+            end_idx = L - window_size + 1
+            for s in range(start_idx, end_idx, step):
+                window = values[s:s+window_size, :]
+                feat = feature_extractor(window)
+                target = float(rul[s + window_size - 1])
+                cycle = int(g_sorted.loc[s + window_size - 1, 'cycle'])
+                samples.append(feat)
+                labels.append(target)
+                metas.append({'unit': int(unit), 'cycle': cycle})
+        elif mode == 'per_cycle':
+            for idx in range(window_size - 1, L):
+                s = idx - (window_size - 1)
+                window = values[s:idx+1, :]
+                feat = feature_extractor(window)
+                target = float(rul[idx])
+                cycle = int(g_sorted.loc[idx, 'cycle'])
+                samples.append(feat)
+                labels.append(target)
+                metas.append({'unit': int(unit), 'cycle': cycle})
+        else:
+            raise ValueError("Unknown mode: choose 'sliding' or 'per_cycle'")
+
+    if len(samples) == 0:
+        raise ValueError("Не удалось сформировать ни одного окна — попробуйте уменьшить window_size")
+    X = np.vstack(samples).astype(float)
+    y = np.array(labels).astype(float)
+    return X, y, metas
+
+def prepare_cmapss_supervised(train_path: str,
+                              test_path: str,
+                              test_rul_path: str,
+                              n_settings: int = 3,
+                              window_size: int = 30,
+                              step: int = 1,
+                              sensors_only: bool = True,
+                              feature_extractor = None,
+                              scale: bool = True):
+    df_train = read_cmapss_file(train_path, n_settings=n_settings)
+    df_test = read_cmapss_file(test_path, n_settings=n_settings)
+    rul_arr = read_rul_file(test_rul_path)
+
+    df_train = attach_rul_train(df_train)
+    df_test = attach_rul_test(df_test, rul_arr)
+
+    X_tr, y_tr, meta_tr = build_cmapss_window_dataset(df_train, window_size=window_size, step=step,
+                                                      sensors_only=sensors_only, feature_extractor=feature_extractor)
+    X_te, y_te, meta_te = build_cmapss_window_dataset(df_test, window_size=window_size, step=step,
+                                                      sensors_only=sensors_only, feature_extractor=feature_extractor)
+    scaler = None
+    if scale:
+        scaler = StandardScaler()
+        X_tr = scaler.fit_transform(X_tr)
+        X_te = scaler.transform(X_te)
+
+    return {
+        'X_train': X_tr, 'y_train': y_tr, 'meta_train': meta_tr,
+        'X_test': X_te, 'y_test': y_te, 'meta_test': meta_te,
+        'scaler': scaler
+    }
+
 def _process_unit_worker(args):
     (unit_df,
      window_size,
@@ -117,10 +247,8 @@ def build_cmapss_window_dataset_parallel(
 
     return X_all, y_all, meta_all
 
-
 def build_windows_matrix_from_df(df: pd.DataFrame, window_size: int = 30, step: int = 1,
                                  sensors_only: bool = True, mode: str = 'sliding'):
-
     sensor_cols = [c for c in df.columns if c.startswith('sensor_')]
     if sensors_only:
         feat_cols = sensor_cols
@@ -143,7 +271,7 @@ def build_windows_matrix_from_df(df: pd.DataFrame, window_size: int = 30, step: 
         if mode == 'sliding':
             for start in range(0, L - T + 1, step):
                 end = start + T
-                windows.append(Xmat[start:end, :])            # (T, C)
+                windows.append(Xmat[start:end, :])
                 targets.append(float(RUL[end - 1]))
                 metas.append({'unit': int(unit), 'cycle': int(g.loc[end - 1, 'cycle'])})
         elif mode == 'per_cycle':
@@ -157,12 +285,11 @@ def build_windows_matrix_from_df(df: pd.DataFrame, window_size: int = 30, step: 
 
     if len(windows) == 0:
         return np.zeros((0, window_size, 0)), np.array([]), []
-    W = np.stack(windows, axis=0)  # (N, T, C)
+    W = np.stack(windows, axis=0)
     return W, np.array(targets, dtype=float), metas
 
 def feature_extractor_gpu_batch(windows_np: np.ndarray, device: Optional[torch.device] = None,
                                 last_ns: List[int] = [5,10,20]):
-
     if windows_np.size == 0:
         return np.zeros((0, 0), dtype=float)
 
@@ -172,95 +299,111 @@ def feature_extractor_gpu_batch(windows_np: np.ndarray, device: Optional[torch.d
     W = torch.from_numpy(windows_np.astype(np.float32)).to(device)
     N, T, C = W.shape
 
-
     mean = W.mean(dim=1)
     std = W.std(dim=1, unbiased=False)
     median = W.median(dim=1).values
     mn = W.min(dim=1).values
-    mx = W.max(dim=1).values     
+    mx = W.max(dim=1).values
     ptp = mx - mn
+    rms = torch.sqrt((W**2).mean(dim=1))
+    W_sorted, _ = torch.sort(W, dim=1)
+    idx25 = torch.clamp((T * 0.25).long(), 0, T-1)
+    idx75 = torch.clamp((T * 0.75).long(), 0, T-1)
+    q25 = W_sorted[:, idx25, :]
+    q75 = W_sorted[:, idx75, :]
+    iqr = q75 - q25
 
-def feature_extractor(window: np.ndarray) -> np.ndarray:
+    mean_expanded = mean.unsqueeze(1)
+    xm = W - mean_expanded
+    m2 = (xm**2).mean(dim=1)
+    m3 = (xm**3).mean(dim=1)
+    m4 = (xm**4).mean(dim=1)
+    eps = 1e-8
+    std_safe = torch.sqrt(m2.clamp(min=eps))
+    skew = m3 / (std_safe**3 + eps)
+    kurt = m4 / (std_safe**4 + eps) - 3.0
 
-    T, C = window.shape
-    feats = []
+    stats_list = [mean, std, median, mn, mx, ptp, rms, q25, q75, iqr, skew, kurt]
+    stats_cat = torch.cat([s.reshape(N, -1) for s in stats_list], dim=1)
 
-    for ch in range(C):
-        x = window[:, ch].astype(float)
+    dx = torch.gradient(W, dim=1)[0]
+    ddx = torch.gradient(dx, dim=1)[0]
+    dx_mean = dx.mean(dim=1); dx_std = dx.std(dim=1, unbiased=False)
+    ddx_mean = ddx.mean(dim=1); ddx_std = ddx.std(dim=1, unbiased=False)
+    deriv_cat = torch.cat([dx_mean.reshape(N,-1), dx_std.reshape(N,-1), ddx_mean.reshape(N,-1), ddx_std.reshape(N,-1)], dim=1)
 
-        mean = x.mean()
-        std = x.std() if x.size > 1 else 0.
-        median = np.median(x)
-        mn = x.min()
-        mx = x.max()
-        ptp = mx - mn
-        rms = np.sqrt(np.mean(x**2))
-        q25, q75 = np.percentile(x, [25, 75])
-        iqr = q75 - q25
-
-        try:
-            skew = stats.skew(x)
-            kurt = stats.kurtosis(x)
-        except:
-            skew, kurt = 0.0, 0.0
-
-        feats += [
-            mean, std, median, mn, mx,
-            ptp, rms, q25, q75, iqr,
-            skew, kurt
-        ]
-
-    for ch in range(C):
-        x = window[:, ch].astype(float)
-        dx = np.gradient(x)
-        ddx = np.gradient(dx)
-        feats += [
-            dx.mean(), dx.std(),
-            ddx.mean(), ddx.std()
-        ]
-
-    for last_n in [5, 10, 20]:
+    last_feats = []
+    for last_n in last_ns:
         if T >= last_n:
-            x_last = window[-last_n:, :]
-            feats.append(x_last.mean())
-            feats.append(x_last.std())
+            x_last = W[:, -last_n:, :]
+            last_mean = x_last.mean(dim=1)
+            last_std = x_last.std(dim=1, unbiased=False)
+            last_feats.append(last_mean.reshape(N, -1))
+            last_feats.append(last_std.reshape(N, -1))
         else:
-            feats += [0.0, 0.0]
+            last_feats.append(torch.zeros((N, C), device=device).reshape(N, -1))
+            last_feats.append(torch.zeros((N, C), device=device).reshape(N, -1))
+    last_cat = torch.cat(last_feats, dim=1) if last_feats else torch.zeros((N,0), device=device)
 
-    t_idx = np.arange(T)
-    for ch in range(C):
-        x = window[:, ch].astype(float)
-        if np.all(x == x[0]):
-            slope = 0.0
-        else:
-            # slope = cov(t,x)/var(t)
-            slope = np.cov(t_idx, x)[0, 1] / np.var(t_idx)
-        feats.append(slope)
+    t_idx = torch.arange(T, dtype=W.dtype, device=device).unsqueeze(0).unsqueeze(2)
+    t_mean = t_idx.mean(dim=1)
+    t_centered = t_idx - t_mean
+    var_t = (t_centered**2).mean(dim=1).reshape(1)
+    cov = (t_centered * (W - mean.unsqueeze(1))).mean(dim=1)
+    slope = cov / (var_t + eps)
+    slope_cat = slope.reshape(N, -1)
 
-    for ch in range(C):
-        x = window[:, ch]
-        base = x[0] if x[0] != 0 else 1e-6
-        feats.append((x[-1] - x[0]) / base)
-        feats.append(x[-1] / base)
+    first = W[:, 0, :] + eps
+    last = W[:, -1, :]
+    rel_change = (last - first) / first
+    rel_level = last / first
+    rel_cat = torch.cat([rel_change.reshape(N, -1), rel_level.reshape(N, -1)], dim=1)
 
-    for ch in range(C):
-        x = window[:, ch].astype(float)
-        x = x - x.mean()
-        if T < 8:
-            feats += [0., 0., 0., 0., 0.]
-            continue
+    Wz = W - mean.unsqueeze(1)
+    yf = torch.fft.rfft(Wz, dim=1)
+    yf_abs = torch.abs(yf)
+    Lfreq = yf_abs.shape[1]
+    nb = 4
+    band = max(1, Lfreq // nb)
+    band_feats = []
+    for b in range(nb):
+        s = b * band
+        e = min(Lfreq, (b+1) * band)
+        band_sum = yf_abs[:, s:e, :].sum(dim=1)
+        band_feats.append(band_sum.reshape(N, -1))
+    total_energy = yf_abs.sum(dim=1).reshape(N, -1)
+    fft_cat = torch.cat(band_feats + [total_energy], dim=1)
 
-        yf = np.abs(rfft(x))
-        L = len(yf)
-        nb = 4
-        band = L // nb
-        for b in range(nb):
-            s = b * band
-            e = min(L, (b + 1) * band)
-            feats.append(yf[s:e].sum())
-        feats.append(yf.sum())  # total energy
+    features = torch.cat([stats_cat, deriv_cat, last_cat, slope_cat, rel_cat, fft_cat], dim=1)
+    features_np = features.detach().cpu().numpy()
+    return features_np
 
-    return np.array(feats, dtype=float)
+def build_cmapss_window_dataset_gpu(df: pd.DataFrame,
+                                    window_size: int = 30,
+                                    step: int = 1,
+                                    sensors_only: bool = True,
+                                    mode: str = 'sliding',
+                                    batch_size: int = 1024,
+                                    device: Optional[torch.device] = None):
+
+    windows_np, y_arr, meta = build_windows_matrix_from_df(df, window_size=window_size, step=step,
+                                                           sensors_only=sensors_only, mode=mode)
+    if windows_np.size == 0:
+        return np.zeros((0,0)), np.array([]), []
+
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    N = windows_np.shape[0]
+    feats_list = []
+    bs = min(batch_size, N)
+    for i in range(0, N, bs):
+        wbatch = windows_np[i:i+bs]  # (b, T, C)
+        feats_b = feature_extractor_gpu_batch(wbatch, device=device)
+        feats_list.append(feats_b)
+    X = np.vstack(feats_list)
+    y = y_arr.copy()
+    return X, y, meta
 
 def cap_rul(df: pd.DataFrame, max_rul: int = 125) -> pd.DataFrame:
     df = df.copy()
@@ -1038,3 +1181,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
