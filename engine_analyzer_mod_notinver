@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import argparse
+import json
+import time
+import math
+from typing import List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+import scipy.stats as stats
+from scipy.fft import rfft
+from scipy.io import loadmat
+
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score, accuracy_score
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+
+# =======================
+# RUL TRANSFORMS
+# =======================
+
+def hard_cap_rul(x, cap=125.0):
+    return np.minimum(x, cap)
+
+
+def soft_cap_rul(x, alpha=40.0, beta=20.0):
+    return alpha * np.log1p(x / beta)
+
+
+# =======================
+# FEATURE EXTRACTION
+# =======================
+
+def extract_window_features(w: np.ndarray) -> np.ndarray:
+    T, C = w.shape
+    feats = []
+    t = np.arange(T)
+
+    for c in range(C):
+        x = w[:, c].astype(float)
+        dx = np.gradient(x)
+        ddx = np.gradient(dx)
+
+        feats.extend([
+            x.mean(), x.std(), np.median(x),
+            x.min(), x.max(), np.ptp(x),
+            np.sqrt(np.mean(x**2)),
+            np.percentile(x, 25), np.percentile(x, 75),
+            stats.skew(x), stats.kurtosis(x),
+            dx.mean(), dx.std(),
+            ddx.mean(), ddx.std(),
+            np.cov(t, x)[0, 1] / (np.var(t) + 1e-8),
+            (x[-1] - x[0]) / (x[0] + 1e-6)
+        ])
+
+        yf = np.abs(rfft(x - x.mean()))
+        feats.extend([
+            yf[:len(yf)//4].sum(),
+            yf[len(yf)//4:len(yf)//2].sum(),
+            yf[len(yf)//2:].sum(),
+            yf.sum()
+        ])
+
+    return np.array(feats, dtype=np.float32)
+
+
+# =======================
+# C-MAPSS DATA
+# =======================
+
+def read_cmapss(path: str, n_settings=3):
+    df = pd.read_csv(path, sep=r"\s+", header=None)
+    n_cols = df.shape[1]
+    n_sensors = n_cols - 2 - n_settings
+    df.columns = (
+        ["unit", "cycle"]
+        + [f"op_{i}" for i in range(n_settings)]
+        + [f"s_{i}" for i in range(n_sensors)]
+    )
+    return df
+
+
+def attach_rul_train(df):
+    max_c = df.groupby("unit")["cycle"].transform("max")
+    rul = max_c - df["cycle"]
+    df["RUL"] = soft_cap_rul(hard_cap_rul(rul))
+    return df
+
+
+def attach_rul_test(df, rul_arr):
+    units = sorted(df.unit.unique())
+    rul_map = dict(zip(units, rul_arr))
+    max_c = df.groupby("unit")["cycle"].transform("max")
+    df["RUL"] = soft_cap_rul(
+        hard_cap_rul(
+            df.apply(lambda r: rul_map[r.unit] + max_c[r.name] - r.cycle, axis=1)
+        )
+    )
+    return df
+
+
+def build_windows(df, window=30, step=1):
+    sensors = [c for c in df.columns if c.startswith("s_")]
+    X, y = [], []
+
+    for _, g in df.groupby("unit"):
+        g = g.sort_values("cycle")
+        arr = g[sensors].values
+        rul = g["RUL"].values
+
+        for i in range(0, len(g) - window + 1, step):
+            w = arr[i:i+window]
+            X.append(extract_window_features(w))
+            y.append(rul[i + window - 1])
+
+    return np.vstack(X), np.array(y)
+
+
+# =======================
+# DATASET
+# =======================
+
+class EngineDataset(Dataset):
+    def __init__(self, X, y=None):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = None if y is None else torch.tensor(y, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, i):
+        if self.y is None:
+            return self.X[i]
+        return self.X[i], self.y[i]
+
+
+# =======================
+# MODELS
+# =======================
+
+class MLP(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d, 512),
+            nn.BatchNorm1d(512),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 1)
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+# =======================
+# TRAINING
+# =======================
+
+def train(model, tr, va, device, epochs=100):
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
+    loss_fn = nn.MSELoss()
+
+    best = 1e9
+    for _ in range(epochs):
+        model.train()
+        for x, y in tr:
+            x, y = x.to(device), y.to(device)
+            opt.zero_grad()
+            loss = loss_fn(model(x), y)
+            loss.backward()
+            opt.step()
+        sch.step()
+
+        model.eval()
+        with torch.no_grad():
+            val = np.mean([
+                loss_fn(model(x.to(device)), y.to(device)).item()
+                for x, y in va
+            ])
+        if val < best:
+            best = val
+            torch.save(model.state_dict(), "best.pt")
+
+    model.load_state_dict(torch.load("best.pt"))
+    return model
+
+
+# =======================
+# MAIN
+# =======================
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--train")
+    p.add_argument("--test")
+    p.add_argument("--rul")
+    args = p.parse_args()
+
+    df_tr = attach_rul_train(read_cmapss(args.train))
+    df_te = attach_rul_test(read_cmapss(args.test), np.loadtxt(args.rul))
+
+    Xtr, ytr = build_windows(df_tr)
+    Xte, yte = build_windows(df_te)
+
+    scaler = RobustScaler()
+    Xtr = scaler.fit_transform(Xtr)
+    Xte = scaler.transform(Xte)
+
+    Xtr, Xv, ytr, yv = train_test_split(Xtr, ytr, test_size=0.2)
+
+    tr = DataLoader(EngineDataset(Xtr, ytr), 256, True)
+    va = DataLoader(EngineDataset(Xv, yv), 256)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MLP(Xtr.shape[1]).to(device)
+
+    model = train(model, tr, va, device)
+
+    with torch.no_grad():
+        pred = model(torch.tensor(Xte, device=device)).cpu().numpy()
+
+    print("MSE:", mean_squared_error(yte, pred))
+    print("R2:", r2_score(yte, pred))
+
+
+if __name__ == "__main__":
+    main()
