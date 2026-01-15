@@ -24,7 +24,6 @@ from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score, accuracy_score, roc_auc_score
 import matplotlib.pyplot as plt
-from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -1181,4 +1180,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
